@@ -1,0 +1,13 @@
+# 构建产物
+.build/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+
+# 系统文件
+.DS_Store
+
+# 模型资产（体积大，不入库；请自行放置）
+*.glb
+*.gltf
+*.bin

@@ -260,12 +260,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         var lodTriangles = [0, 0, 0]
     }
 
-    /// LOD 画面像素半径阈值：bounds[i] 是 LODi 与 LOD(i+1) 的分界
-    private enum LODThreshold {
-        static let bounds: [Float] = [160, 60]
-        static let cullRadius: Float = 2
-        static let hysteresisUp: Float = 1.2     // 升档（细节增加）需越过阈值 ×1.2
-        static let hysteresisDown: Float = 0.8   // 降档（细节减少）需低于阈值 ×0.8
+    /// LOD 画面像素半径阈值（可调，供实验面板实时修改）
+    private struct LODThresholdSet {
+        var bounds: [Float] = [160, 60]
+        var cullRadius: Float = 2
+        var hysteresisUp: Float = 1.2
+        var hysteresisDown: Float = 0.8
     }
 
     private let device: MTLDevice
@@ -284,10 +284,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastFrameTime: CFTimeInterval = 0
     private var smoothedFPS: Double = 0
 
-    /// 保护锁定档位与统计快照（渲染线程写、主线程读）
+    /// 保护锁定档位、渲染模式、光照、LOD 阈值与统计快照（渲染线程写、主线程读）
     private let stateLock = NSLock()
     private var lockedLOD: Int?
     private var renderMode: RenderMode = .shaded
+    private var lightDirection: SIMD3<Float> = simd_normalize(SIMD3<Float>(0.45, 0.8, 0.55))
+    private var lodThresholds = LODThresholdSet()
     private var lastStats = FrameStats()
 
     /// 包围盒线框渲染资源
@@ -540,6 +542,63 @@ final class Renderer: NSObject, MTKViewDelegate {
         return lockedLOD
     }
 
+    /// 供控制面板显示的锁定状态
+    func lodLockText() -> String {
+        currentLock().map { "LOD\($0)" } ?? "自动"
+    }
+
+    // MARK: 实验参数（FOV / 光照 / LOD 阈值）
+
+    func setFOVDegrees(_ degrees: Float) {
+        cameraLock.lock()
+        camera.fov = degrees * Float.pi / 180
+        cameraLock.unlock()
+    }
+
+    func fovDegrees() -> Float {
+        cameraLock.lock()
+        defer { cameraLock.unlock() }
+        return camera.fov * 180 / Float.pi
+    }
+
+    func setLightDirection(_ dir: SIMD3<Float>) {
+        let n = simd_length(dir) > 1e-6 ? simd_normalize(dir) : SIMD3<Float>(0, 1, 0)
+        stateLock.lock()
+        lightDirection = n
+        stateLock.unlock()
+    }
+
+    private func currentLightDirection() -> SIMD3<Float> {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lightDirection
+    }
+
+    func setLODThresholds(bounds: [Float], cullRadius: Float) {
+        stateLock.lock()
+        lodThresholds.bounds = bounds
+        lodThresholds.cullRadius = cullRadius
+        stateLock.unlock()
+    }
+
+    func lodThresholdBounds() -> [Float] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lodThresholds.bounds
+    }
+
+    func lodCullRadius() -> Float {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lodThresholds.cullRadius
+    }
+
+    private func currentLODThresholds() -> LODThresholdSet {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lodThresholds
+    }
+
     private func statsSnapshot() -> FrameStats {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -553,22 +612,22 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     /// 依据屏幕像素半径选档，带 hysteresis 避免边界处来回跳变
-    private func selectLOD(pixelRadius: Float, current: Int) -> Int {
+    private func selectLOD(pixelRadius: Float, current: Int, thresholds: LODThresholdSet) -> Int {
         var lod = current
         if lod < 0 {
             // 已被剔除：半径明显变大才重新提交
-            guard pixelRadius > LODThreshold.cullRadius * LODThreshold.hysteresisUp else { return -1 }
+            guard pixelRadius > thresholds.cullRadius * thresholds.hysteresisUp else { return -1 }
             lod = 2
         }
 
-        while lod < 2, pixelRadius < LODThreshold.bounds[lod] * LODThreshold.hysteresisDown {
+        while lod < 2, pixelRadius < thresholds.bounds[lod] * thresholds.hysteresisDown {
             lod += 1
         }
-        while lod > 0, pixelRadius > LODThreshold.bounds[lod - 1] * LODThreshold.hysteresisUp {
+        while lod > 0, pixelRadius > thresholds.bounds[lod - 1] * thresholds.hysteresisUp {
             lod -= 1
         }
 
-        if lod == 2, pixelRadius < LODThreshold.cullRadius * LODThreshold.hysteresisDown {
+        if lod == 2, pixelRadius < thresholds.cullRadius * thresholds.hysteresisDown {
             return -1
         }
         return lod
@@ -641,6 +700,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                              viewProjection: simd_float4x4,
                              drawableSize: CGSize) -> FrameStats {
         let mode = currentRenderMode()
+        let lightDir = currentLightDirection()
+        let thresholds = currentLODThresholds()
 
         encoder.setRenderPipelineState(mode == .boundingBox ? linePipelineState : pipelineState)
         encoder.setDepthStencilState(depthState)
@@ -652,7 +713,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             viewProjection: viewProjection,
             normalMatrix: matrix_identity_float4x4,
             baseColor: SIMD4<Float>(1, 1, 1, 1),
-            lightDirection: simd_normalize(SIMD3<Float>(0.45, 0.8, 0.55)),
+            lightDirection: lightDir,
             cameraPosition: camera.eye
         )
 
@@ -675,7 +736,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             } else {
                 let distance = max(simd_length(camera.eye - item.centerWorld), 1e-4)
                 let pixelRadius = item.radiusWorld * pixelsPerUnit / distance
-                lod = selectLOD(pixelRadius: pixelRadius, current: item.currentLOD)
+                lod = selectLOD(pixelRadius: pixelRadius, current: item.currentLOD, thresholds: thresholds)
                 item.currentLOD = lod
                 if lod < 0 {
                     stats.culledCount += 1
